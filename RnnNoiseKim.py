@@ -28,6 +28,9 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+from io import BytesIO
+import PIL.Image
+
 import locale
 import datetime
 
@@ -292,7 +295,7 @@ class CustomRnnStruct(nn.Module):
         self.NumberOfFits = 0
         self.Tepoch = 0
         self.Session = 0
-
+        self.age = torch.zeros(N, 1,device="cpu",requires_grad=False)
 
 
         if db_path == None:
@@ -606,6 +609,12 @@ class CustomRnnStruct(nn.Module):
 
         BreakFlag = 0
         CatchPerformHistory = list()
+        Reinit_History = []
+        steps = 1
+
+        output_utility  = 0
+        NumOfUnitsToReplace = 0
+
         for epoch in tqdm(range(num_epochs),desc="Epoch",leave=True,disable=True):
             print_loading_bar(epoch, num_epochs)
             if settings["LR_Scheduler"] == "CosineAnnealingLR":
@@ -682,9 +691,10 @@ class CustomRnnStruct(nn.Module):
 
                         if (self.Wr < 0 ).any():
                             self.Wr.clamp_( min=0, max=None)
-                    
+                
+        
 
-                # --------- End Of Batch----------------------------
+                # --------- End Of Batch ----------------------------
 
 
                         
@@ -714,7 +724,16 @@ class CustomRnnStruct(nn.Module):
                         CatchPerformHistory.pop(0)
 
                     
-                    #print("Catch Average: ", CatchAverage)
+                    #--------------Continual Learning Dohare----------------------
+
+                    for i in range(0,len(EvalOutput["rEvals"])):
+                        #print(i)
+                        rateOutput = EvalOutput["rEvals"][i]
+                        output_utility , self.age, NumOfUnitsToReplace, UpdateNeuron = self.reinitNeurons(rateOutput, output_utility , self.age, NumOfUnitsToReplace, settings)
+                        Reinit_History.append(UpdateNeuron)
+                        self.plotReinit(writer,steps,Reinit_History)   
+                        steps += 1   
+                    
 
                     if  (CatchAverage < 0.2 and EvalOutput["eval_perf_catch_mean"] < 0.2) and ( (settings["Tdelay"] > 0 and settings["Delay_Type"] == "Fixed" ) or (settings["Delay_Type"] == "Random") ):
                         print("\n")
@@ -728,9 +747,7 @@ class CustomRnnStruct(nn.Module):
                         BreakFlag = 1
                         break
 
-            #--------------Continual Learning Dohare----------------------
-            
-            self.reinitNeurons()       
+    
 
             #--------------End Of Epoch-----------------------------------
         
@@ -752,23 +769,114 @@ class CustomRnnStruct(nn.Module):
         writer.close()
         return o, Loss, BreakFlag
     
-    def reinitNeurons(self,rateOutput,settings):
+    def reinitNeurons(self,rateOutput, output_utility , age, NumOfUnitsToReplace, settings):
 
         continual_on = settings["Continual"]
         eligible_age =  settings["Eligible Age"]
         replacement_rate = settings["Replacement_Rate"]
         decay_rate = settings["DecayRate"]
 
+        batch_size = rateOutput.shape[0]
+        N = rateOutput.shape[1]
+        blockSteps = rateOutput.shape[2]
+
+        UpdateNeuron = None
+
+        if continual_on == True:
+            Wr_contrib  = torch.zeros(batch_size,N,device="cpu",requires_grad=False)
+            Tau_contrib = torch.zeros(batch_size,N,device="cpu",requires_grad=False)
 
 
-        with torch.no_grad():
 
-            
-            Wr_contrib = (1-decay_rate) * torch.abs(rateOutput) * torch.abs( torch.sum(WrReal,dim = 1) )
-            Tau_contrib = = (1-decay_rate) * torch.abs(rateOutput) * torch.abs( self.tauS)
-            utility = decay_rate * utility + 
+            if self.apply_dale == True:
+                WrDale = torch.relu(self.Wr)
+            else:
+                WrDale = self.Wr
+            WrReal = torch.mul( WrDale, self.SynapseMask).cpu(); 
+            TauS = self.tauS.cpu()
+            TauS = TauS.squeeze() 
+
+            with torch.no_grad():
+
+                #-------------------------------------------------------------------------
+                # Update Age
+                #-------------------------------------------------------------------------
+                
+                age += 1
+                #-------------------------------------------------------------------------
+                # Update Utility
+                #-------------------------------------------------------------------------
+
+                rate_abs = torch.abs(rateOutput)  # [B, N, T]
+                Wr_magnitude = torch.sum(torch.abs(WrReal), dim=0)  # [N]
+                Tau_magnitude = torch.abs(TauS)  # [N]
+
+                Wr_contrib = (1 - decay_rate) * torch.sum(rate_abs * Wr_magnitude[None, :, None], dim=2)
+                Tau_contrib = (1 - decay_rate) * torch.sum(rate_abs * Tau_magnitude[None, :, None], dim=2)
+
+                
+                # Average Across the Batches
+                Wr_contrib_avg  = torch.mean(Wr_contrib, dim=0) 
+                Tau_contrib_avg = torch.mean(Tau_contrib,dim=0)
+
+                # Calculate Output Utility 
+                output_utility = decay_rate * output_utility + (1-decay_rate)*Wr_contrib_avg + (1-decay_rate)*Tau_contrib_avg
+                
+                #-------------------------------------------------------------------------
+                # Find eligible units: neligible = number of units with age greater than m
+                #-------------------------------------------------------------------------
+                eligible_units = (age > eligible_age).sum()
+
+
+                NumOfUnitsToReplace = NumOfUnitsToReplace + (eligible_units*replacement_rate)
+
+                
+                if NumOfUnitsToReplace > 1:
+
+                    min_utility_index = torch.argmin(output_utility)
+                    WrN_init = (np.random.normal(loc=0, scale=1.0, size=N))/np.sqrt(N*self.prob_rec)*self.gain
+                    if self.apply_dale == True:
+                        WrN = np.abs(WrN_init)
+
+                    tauSN = np.random.uniform(self.tausRange[0], self.tausRange[1],1)
+
+                    self.tauS[min_utility_index,0] = torch.tensor(tauSN)
+                    self.Wr[:,min_utility_index] = torch.tensor(WrN)
+                    self.Wout[0,min_utility_index] = 0
+
+                    output_utility[min_utility_index] = 0
+                    age[min_utility_index] = 0
+                    NumOfUnitsToReplace -= 1
+
+                    UpdateNeuron = min_utility_index
+
+        return output_utility , age, NumOfUnitsToReplace, UpdateNeuron
 
     
+    def plotReinit(self,writer,steps,Reinit_History):
+
+        epochs = np.arange(steps)
+        # Create marker-only plot
+        fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+        #print(epochs)
+        #print(Reinit_History)
+        ax.plot(epochs, Reinit_History, '.')  # 'o' for circular markers, no line
+        ax.set_title("Reinit Neurons")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Neuron")
+        ax.set_ylim(bottom=-1,top = self.N + 1)
+        ax.set_xlim(left=0,right = steps)
+
+        # Save to buffer and convert to image
+        buf = BytesIO()
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')  # lower DPI
+        buf.seek(0)
+        image = PIL.Image.open(buf)
+        image = np.array(image)
+
+
+        writer.add_image("Reinit Neurons", image, global_step=steps, dataformats='HWC')
+
     
     def stimInputTrial_Train(self,settings, nB,stimHistCalc):
         
